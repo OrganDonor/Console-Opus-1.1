@@ -4,6 +4,11 @@
 // Requires Arduino MEGA 2560 board and Arduino 1.5.8 (or at least not 1.0.6)
 // 2014-10-07 ptw created.
 // 2014-10-14 ptw updated to match as-built hardware.
+// 2014-10-18 ptw mapped external MIDI inputs to channel 1
+// 2015-06-11 ptw reduced max note count (blowing fuses!) and sent allOff() when external MIDI switched off
+// 2015-06-11 ptw send Note Off commands to unused notes one by one instead of all in a batch
+// 2015-06-12 ptw Integrated note counting with note request tracking, so we don't mistakenly count down
+//                for the Note Off corresponding to a Note On that was discarded.
 
 // Pin assignments for the control console:
 #define PIN_8GREAT      41
@@ -63,7 +68,7 @@ MIDI_CREATE_INSTANCE(HardwareSerial, Serial3, midi3);
 #define  rankForChannel(x)   (x-1)
 
 // But we limit how many are sounded simultaneously over all ranks
-#define  MaxAllowedNotes  30
+#define  MaxAllowedNotes  24
 
 // Keep track of all the ways each note has been requested on,
 // as a bitmap in a byte for each possible MIDI pitch.
@@ -96,6 +101,58 @@ void allOff(void)
   noteCount = 0;
 }
 
+/*
+// send a redundant Note Off command to each note that isn't supposed to be playing right now.
+// Never used this, for fear of the big blob of commands all going out at once and displacing
+// real notes. Switched to incrementalReOff() instead.
+void reOff(void)
+{
+  byte rank, pitch;
+  
+  for (pitch=0; pitch < 128; pitch++)
+  {
+    for (rank=0; rank < RANKS; rank++)
+    {
+      if (0 == noteIsOn[rank][pitch])
+      {
+        midiOrgan.sendNoteOff(pitch, 0, channelForRank(rank));
+      }
+    }
+  }
+}
+*/
+
+// Send a redundant Note Off command to a note if it isn't supposed to be playing right now.
+// Eventually send one to all such notes, thus unsticking any notes that got stuck on
+// downstream of here (i.e., in the MTP8 boards). 
+void incrementalReOff(void)
+{
+  static byte rank = 0;
+  static byte pitch = 0;
+  
+  // Don't turn off a note that's supposed to be on!
+  // Just skip this round in that case, no need to search for a note to turn off.
+  if (!noteIsOn[rank][pitch])
+  {
+    midiOrgan.sendNoteOff(pitch, 0, channelForRank(rank));
+  }
+  
+  // Go on to the next note, wrapping around.
+  if (++rank >= RANKS)
+  {
+    rank = 0;
+    if (++pitch >= 128)
+    {
+      pitch = 0;
+    }
+  }
+}
+
+/* NOT USED ANYMORE
+   The note counting had to be integrated with the individual note tracking, because
+   if we discard a Note On (due to count limiting) we need to remember not to decrement
+   the note count when the corresponding Note Off comes in.
+   
 // startNote and stopNote are the bottom of the stack.
 // They are responsible for limiting the number of simultaneous notes being sounded,
 // and for sending the actual Note On and Note Off messages to MIDI.
@@ -104,11 +161,13 @@ void startNote(byte rank, byte pitch)
   if (noteCount >= MaxAllowedNotes)
   {  // too many notes already being played to allow this one!
     //!!! do something cute here
+    Serial.println("x");
   }
   else
   {
     noteCount++;
     midiOrgan.sendNoteOn(pitch, 127, channelForRank(rank));
+    Serial.println(noteCount);
   }
 }
 
@@ -117,14 +176,20 @@ void stopNote(byte rank, byte pitch)
   midiOrgan.sendNoteOff(pitch, 0, channelForRank(rank));
   if (noteCount > 0)
     noteCount--;
+  Serial.println(noteCount);
 }
+*/
 
-// requestOn and requestOff are the next layer up in the stack from startNote and stopNote.
-// They are responsible for combining all the different possible ways a note can be requested
-// (directly, through a sub-octave or super-octave coupler, or linked from the other manual).
+// All note playing flows through requestOn and requestOff. They are responsible for two main
+// things:
+// 1. combining all the different possible ways a note can be requested
+// (directly, through a sub-octave or super-octave coupler, linked from the other manual).
 //
-// Notes already playing are not re-played. This is appropriate for the pipe organ but not for
-// the general case.
+// 2. keeping track of how many notes are being played, so as to limit the current pulled through
+// the Peterson valvles and not blow any fuses.
+//
+// Notes already playing are not re-played. This may be sort of appropriate for the pipe organ,
+// but would not be good for the general case.
 void requestOn(byte flag, byte rank, byte pitch)
 {
   byte oldReq, newReq;
@@ -133,9 +198,14 @@ void requestOn(byte flag, byte rank, byte pitch)
   newReq = oldReq | flag;
   
   if (oldReq == 0  && newReq != 0)
-    startNote(rank, pitch);
+    if (noteCount < MaxAllowedNotes)
+    {
+      noteCount++;
+      midiOrgan.sendNoteOn(pitch, 127, channelForRank(rank));
+      noteIsOn[rank][pitch] = newReq;
+    }
     
-  noteIsOn[rank][pitch] = newReq;
+  Serial.println(noteCount);
 }
 
 void requestOff(byte flag, byte rank, byte pitch)
@@ -146,9 +216,13 @@ void requestOff(byte flag, byte rank, byte pitch)
   newReq = oldReq & ~flag;
   
   if (oldReq != 0  &&  newReq == 0)
-    stopNote(rank, pitch);
-    
-  noteIsOn[rank][pitch] = newReq;
+  {
+    midiOrgan.sendNoteOff(pitch, 0, channelForRank(rank));
+    noteCount--;    
+    noteIsOn[rank][pitch] = newReq;
+  }
+  
+  Serial.println(noteCount);
 }
 
 // These handlers are called by the MIDI library when the corresponding
@@ -262,14 +336,16 @@ void handleExtNoteOn(byte channel, byte pitch, byte velocity)
   {
     if (velocity != 0)
     {
-      requestOn(NOTE_PRIME, 0, pitch);
+      requestOn(NOTE_PRIME, 1, pitch);
       Serial.print("on  ");
+      Serial.print(pitch, HEX);
       Serial.println(pitch);
     }
     else
     {
-      requestOff(NOTE_PRIME, 0, pitch);
+      requestOff(NOTE_PRIME, 1, pitch);
       Serial.print("of0 ");
+      Serial.print(pitch, HEX);
       Serial.println(pitch);
     }
   }
@@ -280,8 +356,9 @@ void handleExtNoteOff(byte channel, byte pitch, byte unused_velocity)
   // External MIDI just passes thru, if enabled
   if (flagMidi)
   {
-    requestOff(NOTE_PRIME, 0, pitch);
+    requestOff(NOTE_PRIME, 1, pitch);
     Serial.print("off ");
+    Serial.print(pitch, HEX);
     Serial.println(pitch);
   }
 
@@ -293,6 +370,8 @@ void handleExtNoteOff(byte channel, byte pitch, byte unused_velocity)
 // This function looks at the current state of all the controls and updates.
 void pollControlPanel()
 {
+  boolean oldFlagMidi = flagMidi;
+  
   // Read control console latching switches into these flags.
   flag8Great = !digitalRead(PIN_8GREAT);
   flag8Swell = !digitalRead(PIN_8SWELL);
@@ -304,6 +383,11 @@ void pollControlPanel()
   flag4Super = !digitalRead(PIN_4SUPER);
   flagMidi   = !digitalRead(PIN_MIDI);
   flagBlower = !digitalRead(PIN_BLOWER);
+  
+  if (oldFlagMidi && !flagMidi) {
+    // External MIDI turned off, make sure all the notes are terminated
+    allOff();
+  }
   
   // The switches are illuminated; echo the switch state to its LED
   digitalWrite(PIN_8GREAT_LED, flag8Great);
@@ -390,9 +474,18 @@ void setup()
 
 void loop()
 {
+  static unsigned long lasttick = millis();
+  
   pollControlPanel();
   midiGreat.read();
   midiSwell.read();
   midiExt.read();
+
+  if (millis() > lasttick + 5)
+  {
+    lasttick = millis();
+    incrementalReOff();
+  }
+
 }
 
