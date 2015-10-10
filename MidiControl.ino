@@ -255,18 +255,35 @@ void handleSwellNoteOff(byte channel, byte pitch, byte unused_velocity)
 
 }
 
-void handleExtNoteOn(byte channel, byte pitch, byte unused_velocity)
+void handleExtNoteOn(byte channel, byte pitch, byte velocity)
 {
   // External MIDI just passes thru, if enabled
   if (flagMidi)
-    requestOn(NOTE_PRIME, rankForChannel(channel), pitch);
+  {
+    if (velocity != 0)
+    {
+      requestOn(NOTE_PRIME, 0, pitch);
+      Serial.print("on  ");
+      Serial.println(pitch);
+    }
+    else
+    {
+      requestOff(NOTE_PRIME, 0, pitch);
+      Serial.print("of0 ");
+      Serial.println(pitch);
+    }
+  }
 }
 
 void handleExtNoteOff(byte channel, byte pitch, byte unused_velocity)
 {
   // External MIDI just passes thru, if enabled
   if (flagMidi)
-    requestOff(NOTE_PRIME, rankForChannel(channel), pitch);
+  {
+    requestOff(NOTE_PRIME, 0, pitch);
+    Serial.print("off ");
+    Serial.println(pitch);
+  }
 
 }
 
