@@ -1,5 +1,5 @@
 #include <MIDI.h>
-// MIDI Controller for Organ Donor Opus 1
+// MIDI Controller for Organ Donor Opus 1.1
 // Two manuals and two ranks, initial version control panel
 // Requires Arduino MEGA 2560 board and Arduino 1.5.8 (or at least not 1.0.6)
 // 2014-10-07 ptw created.
@@ -9,6 +9,18 @@
 // 2015-06-11 ptw send Note Off commands to unused notes one by one instead of all in a batch
 // 2015-06-12 ptw Integrated note counting with note request tracking, so we don't mistakenly count down
 //                for the Note Off corresponding to a Note On that was discarded.
+// 2015-06-13 ptw Changed note counting to track notes separately for each MTP8, since they are now fused separately.
+//                Unfortunately this means we need to know the MTP8-to-note mapping.
+
+// MTP Assignments by note in each rank.
+// Converted from file deployment-2015-fair.txt on 2015-06-16T08:20:17.698704 by ./deploy.py
+const byte MTP_table[2][62] PROGMEM = {
+// Rank 4
+{ 0,  0, 0, 1, 0, 0, 1, 0, 0, 0, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 0, 1, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, },
+// Rank 8
+{ 0,  0, 1, 1, 0, 1, 1, 0, 0, 1, 0, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 0, 0, 0, 0, 1, 0, 1, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 0, 1, 1, 1, 1, 0, 0, 1, 1, 1, 1, 1, },
+};
+
 
 // Pin assignments for the control console:
 #define PIN_8GREAT      41
@@ -32,6 +44,7 @@
 #define PIN_4SUPER_LED  26
 #define PIN_MIDI_LED    24
 #define PIN_BLOWER_LED  22
+
 
 // Control console is a bunch of switches, which are read into these flags.
 boolean flag8Great, flag8Swell, flag4Swell, flag4Great;      // enable each rank on each manual
@@ -81,13 +94,21 @@ MIDI_CREATE_INSTANCE(HardwareSerial, Serial3, midi3);
 // We'll use 128 bytes here even though only 61 are valid. Easier.
 byte noteIsOn[RANKS][128];
 
-// Count of how many notes are currently active on the organ.
+// The notes are implemented by a number of MIDI-to-Parallel (MTP) adapters.
+// Each adapter has a separate fuse and current limit, so we need to track the
+// number of notes active on each MTP.
+#define  MTP_COUNT  2
+#define  NO_MTP  (-1)
+byte noteCountForMTP[MTP_COUNT] = { 0, 0 };
+byte maxAllowedNotesForMTP[MTP_COUNT] = { 20, 20 };  // could have per-MTP limit!
+
+// Count of how many total notes are currently active on the organ.
 byte noteCount = 0;
 
 // Initialization or Panic: turn everything off right now.
 void allOff(void)
 {
-  byte rank, pitch;
+  byte rank, pitch, mtp;
   
   for (pitch=0; pitch < 128; pitch++)
   {
@@ -99,6 +120,10 @@ void allOff(void)
   }
   
   noteCount = 0;
+  for (mtp=0; mtp < MTP_COUNT; mtp++)
+  {
+    noteCountForMTP[mtp] = 0;
+  }
 }
 
 /*
@@ -180,6 +205,14 @@ void stopNote(byte rank, byte pitch)
 }
 */
 
+// Determine which MIDI-to-Parallel (MTP) converter handles a specific note,
+// so we can limit the number of notes played on each MTP.
+byte whichMTPForNote(byte rank, byte pitch)
+{
+  return MTP_table[rank][pitch];
+}
+
+
 // All note playing flows through requestOn and requestOff. They are responsible for two main
 // things:
 // 1. combining all the different possible ways a note can be requested
@@ -193,24 +226,37 @@ void stopNote(byte rank, byte pitch)
 void requestOn(byte flag, byte rank, byte pitch)
 {
   byte oldReq, newReq;
+  byte whichMTP;
+  
+  whichMTP = whichMTPForNote(rank, pitch);
+  if (whichMTP == NO_MTP)
+  {
+    return;
+  }
   
   oldReq = noteIsOn[rank][pitch];
   newReq = oldReq | flag;
   
   if (oldReq == 0  && newReq != 0)
-    if (noteCount < MaxAllowedNotes)
+    if ((noteCount < MaxAllowedNotes) && (noteCountForMTP[whichMTP] < maxAllowedNotesForMTP[whichMTP]))
     {
       noteCount++;
+      noteCountForMTP[whichMTP]++;
       midiOrgan.sendNoteOn(pitch, 127, channelForRank(rank));
       noteIsOn[rank][pitch] = newReq;
     }
-    
-  Serial.println(noteCount);
 }
 
 void requestOff(byte flag, byte rank, byte pitch)
 {
   byte oldReq, newReq;
+  byte whichMTP;
+  
+  whichMTP = whichMTPForNote(rank, pitch);
+  if (whichMTP == NO_MTP)
+  {
+    return;
+  }
 
   oldReq = noteIsOn[rank][pitch];
   newReq = oldReq & ~flag;
@@ -218,11 +264,10 @@ void requestOff(byte flag, byte rank, byte pitch)
   if (oldReq != 0  &&  newReq == 0)
   {
     midiOrgan.sendNoteOff(pitch, 0, channelForRank(rank));
-    noteCount--;    
+    noteCount--;
+    noteCountForMTP[whichMTP]--;    
     noteIsOn[rank][pitch] = newReq;
   }
-  
-  Serial.println(noteCount);
 }
 
 // These handlers are called by the MIDI library when the corresponding
